@@ -1,8 +1,8 @@
 /* Ocean Surf Camp: first screen
    - Layout is plain HTML/CSS. The script only reads where the headline words sit
      and draws photo + headline + surfer on a WebGL canvas behind the copy.
-   - The water effect: a small velocity field (ping-pong textures) bends the photo,
-     FIRST and WAVE. "CATCH YOUR" and the surfer stay sharp.
+   - The water effect: the wave (or the cursor) drags FIRST and WAVE along its trail
+     into long ribbons that slowly ease back. "CATCH YOUR" and the surfer stay sharp.
    - Without WebGL the plain <img> layers stay visible. */
 (function () {
   'use strict';
@@ -175,56 +175,76 @@
     requestAnimationFrame(() => { resizeQueued = false; layout(); centerLabels(); });
   }).observe(hero);
 
-  /* ---------- WebGL ---------- */
+  /* ---------- WebGL ----------
+     Water model (same idea as Lowtide): whatever moves through the headline, the default wave or
+     the cursor, drags the letters along behind it. The pull is strongest in the middle of the trail
+     and fades to nothing at its edges, so letters bend into long smooth ribbons instead of breaking up.
+     The drag is kept in a small offset map that slowly relaxes, so the letters ease back like taffy.
+     A lace of white water follows the trail. */
   function runGL(gl, img) {
     const floatOK = !!gl.getExtension('EXT_color_buffer_float');
     const ENC = floatOK ? 0 : 1;
     const SIM = 320;
-    const SET = { strength: 0.075, radius: 54, decay: 0.976, swirl: 0.016, advect: 0.012, gain: 7.0 };
+    // design px (scaled with the headline size)
+    const WAKE = {
+      band: 72,        // half-width of the trail
+      gain: 2.3,       // how far letters are dragged per px travelled (max drag ≈ band × gain × 1.77)
+      max: 520,        // hard cap on the drag
+      relax: 0.989,    // per frame at 60 fps: lower = letters return faster
+      diffuse: 0.14,   // smooths the offset map so ribbons stay clean
+      foam: 0.22,      // white water added per frame at full speed
+      foamDecay: 0.955,
+      water: 0.45      // the photo moves less than the letters
+    };
 
     const head = '#version 300 es\nprecision highp float;\n#define ENC ' + ENC + '\n';
     const codec = `
-      vec2 dec(vec4 t){
+      vec3 dec(vec4 t){
       #if ENC
-        return t.xy*2.0-1.0;
+        return vec3(t.xy*2.0-1.0, t.z);
       #else
-        return t.xy;
+        return t.xyz;
       #endif
       }
-      vec4 enc(vec2 v){
+      vec4 enc(vec3 v){
       #if ENC
-        return vec4(v*0.5+0.5,0.0,1.0);
+        return vec4(v.xy*0.5+0.5, v.z, 1.0);
       #else
-        return vec4(v,0.0,1.0);
+        return vec4(v, 1.0);
       #endif
       }`;
     const vs = `#version 300 es
       in vec2 p; out vec2 vUv;
       void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 
+    // xy: drag offset (screen px, y down, normalised by uScale), z: white water
     const simFs = head + `in vec2 vUv; out vec4 o;
-      uniform sampler2D uPrev; uniform vec2 uMouse; uniform vec2 uVel;
-      uniform float uRadius; uniform float uDecay; uniform float uAspect; uniform float uSwirl; uniform float uAdvect;
+      uniform sampler2D uPrev; uniform vec2 uMouse; uniform vec2 uDelta; uniform float uFoamAdd;
+      uniform float uBand; uniform float uAspect; uniform float uRelax; uniform float uDiffuse; uniform float uFoamDecay;
       ${codec}
       void main(){
-        vec2 v0 = dec(texture(uPrev, vUv));
-        vec2 v = dec(texture(uPrev, vUv - v0*uAdvect));
-        float s = sin(uSwirl), c = cos(uSwirl);
-        v = mat2(c, s, -s, c) * v;
-        v *= uDecay;
+        vec2 t = 1.0/vec2(${SIM}.0);
+        vec3 c = dec(texture(uPrev, vUv));
+        vec3 n = dec(texture(uPrev, vUv + vec2(t.x, 0.0))) + dec(texture(uPrev, vUv - vec2(t.x, 0.0)))
+               + dec(texture(uPrev, vUv + vec2(0.0, t.y))) + dec(texture(uPrev, vUv - vec2(0.0, t.y)));
+        c.xy = mix(c.xy, n.xy*0.25, uDiffuse) * uRelax;
+        c.z *= uFoamDecay;
         vec2 d = vUv - uMouse; d.x *= uAspect;
-        v += uVel * exp(-dot(d,d)/(uRadius*uRadius));
-        float L = length(v); if (L > 1.0) v /= L;
-        o = enc(v);
+        float g = exp(-dot(d,d)/(uBand*uBand));
+        c.xy += uDelta * g;
+        c.z = min(1.0, c.z + g*uFoamAdd);
+        float L = length(c.xy); if (L > 1.0) c.xy /= L;
+        o = enc(c);
       }`;
 
     // all rects are in CSS px of the hero, origin top-left
     const outFs = head + `in vec2 vUv; out vec4 o;
       uniform sampler2D uSim; uniform sampler2D uBg; uniform sampler2D uFg; uniform sampler2D uMask;
       uniform sampler2D uCatch; uniform sampler2D uFirst; uniform sampler2D uWave;
-      uniform vec2 uRes; uniform vec4 uPhoto; uniform vec2 uStr; uniform float uK;
+      uniform vec2 uRes; uniform vec4 uPhoto; uniform float uScale; uniform float uK; uniform float uWater;
       uniform vec4 uCatchR; uniform vec4 uFirstR; uniform vec4 uWaveR;
       uniform float uBgP; uniform float uCatchP; uniform float uFirstP; uniform float uWaveP;
+      const vec3 ORANGE = vec3(1.0, 0.384, 0.0);
       ${codec}
       vec4 layer(sampler2D t, vec4 r, vec2 px, float slide){
         vec2 l = (px - r.xy)/r.zw;
@@ -233,41 +253,64 @@
         if (l.y < 0.0 || l.y > 1.0) return vec4(0.0);
         return texture(t, l);
       }
+      float words(vec2 px){
+        return max(layer(uFirst, uFirstR, px, (1.0 - uFirstP)*1.08).a,
+                   layer(uWave, uWaveR, px, (1.0 - uWaveP)*1.08).a);
+      }
       vec2 photoUV(vec2 s, float sc){
         vec2 z = (s - 0.5)/sc + 0.5;
         return (z*uRes + uPhoto.xy)/uPhoto.zw;
       }
+      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float vnoise(vec2 p){
+        vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+        return mix(mix(hash(i), hash(i+vec2(1,0)), f.x), mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+      }
       void main(){
         float sc = 1.0 + 0.10*(1.0 - uBgP);
         vec2 s0 = vec2(vUv.x, 1.0 - vUv.y);
+        vec2 px0 = s0*uRes;
         vec2 q0 = photoUV(s0, sc);
-        // keep the water calm on and right around the surfer
-        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);
-        vec2 v = dec(texture(uSim, vUv)) * (1.0 - keep);
-        vec2 uv = vUv - v*uStr;
-        vec2 s = vec2(uv.x, 1.0 - uv.y);
-        vec2 px = s*uRes;
-        vec2 q = photoUV(s, sc);
+        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);   // calm water on the surfer
 
-        vec3 col = texture(uBg, q).rgb;
+        vec3 sim = dec(texture(uSim, vUv));
+        vec2 D = sim.xy * uScale;                 // CSS px, y down: where the water pulled this pixel from
+
+        // photo: dragged less than the letters, and not at all on the surfer
+        vec2 qb = photoUV((px0 - D*uWater*(1.0 - keep))/uRes, sc);
+        vec3 col = texture(uBg, qb).rgb;
         col = mix(vec3(0.016, 0.19, 0.24), col, smoothstep(0.0, 1.0, uBgP));
 
-        // FIRST and WAVE: each word slides up out of its own mask, and bends with the water
-        vec4 h = layer(uFirst, uFirstR, px, (1.0 - uFirstP)*1.08);
-        col = mix(col, h.rgb, h.a);
-        h = layer(uWave, uWaveR, px, (1.0 - uWaveP)*1.08);
-        col = mix(col, h.rgb, h.a);
+        // FIRST WAVE: dragged along the trail. Neighbouring lanes across the trail are averaged and
+        // re-thresholded, so thin slivers merge into a few broad ribbons with clean edges.
+        vec2 p = px0 - D;
+        float dl = length(D);
+        float m = smoothstep(2.0, 26.0*uK, dl);
+        float a = words(p);
+        if (m > 0.0){
+          vec2 nrm = vec2(-D.y, D.x)/max(dl, 1e-4);
+          float step = 2.6*uK*m, acc = 0.0;
+          for (int k = -3; k <= 3; k++) acc += words(p + nrm*step*float(k));
+          a = mix(a, smoothstep(0.3, 0.7, acc/7.0), m);
+        }
+        col = mix(col, ORANGE, a);
+
+        // white water along the fresh trail: the bright caustic net of the photo, bleached
+        float F = sim.z * (1.0 - keep) * smoothstep(0.0, 1.0, uBgP);
+        if (F > 0.002){
+          float lum = dot(texture(uBg, photoUV(s0, sc)).rgb, vec3(0.3, 0.55, 0.15));
+          float lace = smoothstep(0.4, 0.5, lum + 0.16*vnoise(px0/(7.0*uK)) - 0.04);
+          col = mix(col, vec3(0.95, 0.99, 0.98), lace * pow(F, 0.9) * 0.9 * (1.0 - a));
+        }
 
         // the surfer stays still and sharp
         vec4 f = texture(uFg, q0);
         col = mix(col, f.rgb, f.a * smoothstep(0.0, 1.0, uBgP));
 
-        // CATCH YOUR: rises and fades in, never distorted
-        vec4 c = layer(uCatch, uCatchR, s0*uRes - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
+        // CATCH YOUR: rises and fades in, never dragged
+        vec4 c = layer(uCatch, uCatchR, px0 - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
         col = mix(col, c.rgb, c.a * uCatchP);
 
-        // faint sheen where the water is pulled hardest
-        col += vec3(0.85, 1.0, 1.0) * smoothstep(0.35, 1.0, length(v)) * 0.08;
         o = vec4(col, 1.0);
       }`;
 
@@ -306,7 +349,7 @@
       if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
       return t;
     }
-    // soft, slightly grown silhouette of the surfer: the water effect fades out inside it
+    // soft, slightly grown silhouette of the surfer: the water stays calm inside it
     const mc = document.createElement('canvas'); mc.width = 480; mc.height = 270;
     const mx = mc.getContext('2d'); mx.filter = 'blur(5px)';
     for (let i = 0; i < 3; i++) mx.drawImage(img.surfer, 0, 0, 480, 270);
@@ -344,12 +387,21 @@
     let lastInput = -1e9, auto = null, lastAutoEnd = 0, armed = false;
     function setFrom(e) { const r = hero.getBoundingClientRect(); cur.x = e.clientX - r.left; cur.y = e.clientY - r.top; }
     hero.addEventListener('pointerenter', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
+    hero.addEventListener('pointerdown', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
     hero.addEventListener('pointermove', e => {
       if (auto) { auto = null; setFrom(e); last.x = cur.x; last.y = cur.y; }
       setFrom(e); lastInput = performance.now();
     });
+    // steady speed like Lowtide, easing in and out only at the very ends
+    function rideEase(t) {
+      const a = 0.12, b = 0.82, v = 1 / (1 - a / 2 - (1 - b) / 2);
+      if (t < a) return v * t * t / (2 * a);
+      if (t < b) return v * (a / 2 + (t - a));
+      const u = t - b, r = 1 - b;
+      return v * (a / 2 + (b - a) + u - u * u / (2 * r));
+    }
     function startAuto(now) {
-      const dur = clamp(3000 * L.total / (1500 * L.k), 2200, 4200);
+      const dur = clamp(3200 * L.total / (1500 * L.k), 2400, 4600);
       auto = { t0: now, dur };
       const p = pathAt(0); cur.x = last.x = p[0]; cur.y = last.y = p[1];
     }
@@ -361,34 +413,42 @@
     startDOM(reduce ? 0 : 1250);
     setTimeout(() => { armed = true; if (!reduce) startAuto(performance.now()); }, reduce ? 0 : 2300);
 
-    let swap = 0, visible = true;
+    let swap = 0, visible = true, prevNow = performance.now();
     new IntersectionObserver(([e]) => { visible = e.isIntersecting; }).observe(hero);
 
     function frame(now) {
       requestAnimationFrame(frame);
+      const dt = clamp((now - prevNow) / 1000, 0, 0.1); prevNow = now;
       if (!visible || document.hidden) return;
       resize();
       const t = reduce ? 99 : (now - T0) / 1000;
 
       if (auto) {
-        let k = (now - auto.t0) / auto.dur;
+        const k = (now - auto.t0) / auto.dur;
         if (k >= 1) { auto = null; lastAutoEnd = now; }
-        else { k = k * k * (3 - 2 * k); const p = pathAt(k); cur.x = p[0]; cur.y = p[1]; }
-      } else if (armed && !reduce && now - lastInput > 5000 && now - lastAutoEnd > 3500) {
+        else { const p = pathAt(rideEase(k)); cur.x = p[0]; cur.y = p[1]; }
+      } else if (armed && !reduce && now - lastInput > 6000 && now - lastAutoEnd > 4500) {
         startAuto(now);
       }
-      // velocity in the same units the Figma frame used, scaled with the headline size
-      const vx = (cur.x - last.x) * SET.gain / (1920 * L.k);
-      const vy = -(cur.y - last.y) * SET.gain / (1080 * L.k);
+      let dx = cur.x - last.x, dy = cur.y - last.y;
       last.x = cur.x; last.y = cur.y;
+      const step = Math.hypot(dx, dy), cap = 90 * L.k;
+      if (step > cap) { dx *= cap / step; dy *= cap / step; }      // ignore jumps (touch, tab switch)
+      const scale = WAKE.max * L.k;
+      const fr = dt * 60;
 
       const src = swap, dst = 1 - swap;
       gl.bindFramebuffer(gl.FRAMEBUFFER, simFbo[dst]); gl.viewport(0, 0, SIM, SIM);
       gl.useProgram(PS.p);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex[src]); gl.uniform1i(PS.u.uPrev, 0);
-      gl.uniform2f(PS.u.uMouse, cur.x / L.W, 1 - cur.y / L.H); gl.uniform2f(PS.u.uVel, vx, vy);
-      gl.uniform1f(PS.u.uRadius, SET.radius * L.k / L.H); gl.uniform1f(PS.u.uDecay, SET.decay);
-      gl.uniform1f(PS.u.uAspect, L.W / L.H); gl.uniform1f(PS.u.uSwirl, SET.swirl); gl.uniform1f(PS.u.uAdvect, SET.advect);
+      gl.uniform2f(PS.u.uMouse, cur.x / L.W, 1 - cur.y / L.H);
+      gl.uniform2f(PS.u.uDelta, dx * WAKE.gain / scale, dy * WAKE.gain / scale);
+      gl.uniform1f(PS.u.uFoamAdd, WAKE.foam * Math.min(1, step / (8 * L.k)));
+      gl.uniform1f(PS.u.uBand, WAKE.band * L.k / L.H);
+      gl.uniform1f(PS.u.uAspect, L.W / L.H);
+      gl.uniform1f(PS.u.uRelax, Math.pow(WAKE.relax, fr));
+      gl.uniform1f(PS.u.uDiffuse, WAKE.diffuse);
+      gl.uniform1f(PS.u.uFoamDecay, Math.pow(WAKE.foamDecay, fr));
       gl.drawArrays(gl.TRIANGLES, 0, 3); swap = dst;
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
@@ -398,8 +458,9 @@
       bind(4, T.cat, 'uCatch'); bind(5, T.first, 'uFirst'); bind(6, T.wave, 'uWave');
       gl.uniform2f(PO.u.uRes, L.W, L.H);
       gl.uniform4f(PO.u.uPhoto, ...L.photo);
-      gl.uniform2f(PO.u.uStr, SET.strength * 1920 * L.k / L.W, SET.strength * 1080 * L.k / L.H);
+      gl.uniform1f(PO.u.uScale, scale);
       gl.uniform1f(PO.u.uK, L.k);
+      gl.uniform1f(PO.u.uWater, WAKE.water);
       gl.uniform4f(PO.u.uCatchR, ...L.words.catch);
       gl.uniform4f(PO.u.uFirstR, ...L.words.first);
       gl.uniform4f(PO.u.uWaveR, ...L.words.wave);
