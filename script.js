@@ -85,12 +85,13 @@
       ];
     };
     let zoom = 1, ty = 0.5;
-    if (tall > 0) {
+    const stacked = Math.abs(L.words.first[1] - L.words.wave[1]) > L.words.first[3] * 0.5;
+    if (tall > 0 || stacked) {
       // enlarge just enough that the surfer's head starts under the lowest headline line
       const base = Math.max(L.W / PHOTO_W, L.H / PHOTO_H);
       const low = L.words.wave[1] > L.words.first[1] ? L.words.wave : L.words.first;
       const need = (low[1] + low[3] * 0.9) / (SURFER_TOP * base);
-      zoom = clamp(Math.max(need, 1 + 0.1 * tall), 1, 1.4);
+      zoom = clamp(Math.max(need, 1 + 0.1 * tall), 1, 1.45);
       ty = 1;                                   // top of the photo stays at the top
     }
     const g = fit(zoom, ty);
