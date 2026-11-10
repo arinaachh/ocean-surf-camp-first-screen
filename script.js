@@ -1,8 +1,8 @@
 /* Ocean Surf Camp: first screen
    - Layout is plain HTML/CSS. The script only reads where the headline words sit
      and draws photo + headline + surfer on a WebGL canvas behind the copy.
-   - The water effect: the wave (or the cursor) drags FIRST and WAVE along its trail
-     into long ribbons that slowly ease back. "CATCH YOUR" and the surfer stay sharp.
+   - The water effect: a wake leaves the surfer and drags FIRST and WAVE along its curve
+     (same model as Lowtide). "CATCH YOUR" and the surfer stay sharp.
    - Without WebGL the plain <img> layers stay visible. */
 (function () {
   'use strict';
@@ -103,24 +103,21 @@
     buildPath(ds);
   }
 
-  // default wave: from the surfer through FIRST and WAVE, then off screen
+  // Wake: leaves the surfer and crosses the headline on a diagonal, like the wake in Lowtide
+  // crosses the rows, so only a band of letters is bent and the rest stays whole.
+  // Points are relative to the box around FIRST and WAVE (x 0..1 across, y 0..1 down).
   function buildPath(ds) {
-    const f = L.words.first, w = L.words.wave, k = L.k;
-    const at = (rc, x, y) => [rc[0] + rc[2] * x, rc[1] + rc[3] * y];
+    const f = L.words.first, w = L.words.wave;
+    const box = [Math.min(f[0], w[0]), Math.min(f[1], w[1])];
+    box.push(Math.max(f[0] + f[2], w[0] + w[2]) - box[0], Math.max(f[1] + f[3], w[1] + w[3]) - box[1]);
+    const at = ([x, y]) => [box[0] + box[2] * x, box[1] + box[3] * y];
     const pts = [[SURFER_PT[0] * ds - L.photo[0], SURFER_PT[1] * ds - L.photo[1]]];
-    if (Math.abs(f[1] - w[1]) < f[3] * 0.5) {
-      // one line: same curve as the Figma frame, relative to the FIRST WAVE box
-      const line = [f[0], f[1], w[0] + w[2] - f[0], f[3]];
-      [[.383, .95], [.443, .70], [.527, .57], [.617, .46], [.708, .38], [.798, .32], [.888, .28], [.978, .25]]
-        .forEach(([x, y]) => pts.push(at(line, x, y)));
-      pts.push([line[0] + line[2] + 70 * k, line[1] + line[3] * .17]);
-      pts.push([L.W + 120 * k, line[1] + line[3] * .12]);
-    } else {
-      // two lines (phones): along WAVE left to right, then back along FIRST
-      [[.08, .78], [.5, .58], [.95, .45]].forEach(([x, y]) => pts.push(at(w, x, y)));
-      [[.92, .72], [.5, .52], [.06, .36]].forEach(([x, y]) => pts.push(at(f, x, y)));
-      pts.push([-120 * k, f[1] + f[3] * .2]);
-    }
+    const oneLine = Math.abs(f[1] - w[1]) < f[3] * 0.5;
+    // the wake stops at the top of the letters, so no ribbon reaches CATCH YOUR
+    const rel = oneLine
+      ? [[.37, 1.25], [.425, .9], [.485, .5], [.54, .15], [.575, .02]]     // through the T, into the gap before WAVE
+      : [[.30, 1.08], [.42, .76], [.55, .44], [.66, .16], [.72, .03]];    // across WAVE, then FIRST
+    rel.forEach(r => pts.push(at(r)));
     L.path = pts; L.seg = []; L.total = 0;
     for (let i = 0; i < pts.length - 1; i++) {
       const d = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
@@ -176,76 +173,33 @@
   }).observe(hero);
 
   /* ---------- WebGL ----------
-     Water model (same idea as Lowtide): whatever moves through the headline, the default wave or
-     the cursor, drags the letters along behind it. The pull is strongest in the middle of the trail
-     and fades to nothing at its edges, so letters bend into long smooth ribbons instead of breaking up.
-     The drag is kept in a small offset map that slowly relaxes, so the letters ease back like taffy.
-     A lace of white water follows the trail. */
+     Water model ported from Lowtide: a wake leaves the surfer and runs through FIRST WAVE at a
+     steady speed. Behind its head the water drags the letters back along the wake: the pull is
+     strongest in the middle of the band and fades to nothing at its edges, so letters bend into the
+     curve and stay legible. Neighbouring lanes are averaged and re-thresholded, so thin slivers merge
+     into a few broad ribbons with clean edges. Plays once; the bent letters then stay as they are. */
   function runGL(gl, img) {
-    const floatOK = !!gl.getExtension('EXT_color_buffer_float');
-    const ENC = floatOK ? 0 : 1;
-    const SIM = 320;
-    // design px (scaled with the headline size)
-    const WAKE = {
-      band: 72,        // half-width of the trail
-      gain: 2.3,       // how far letters are dragged per px travelled (max drag ≈ band × gain × 1.77)
-      max: 520,        // hard cap on the drag
-      relax: 0.989,    // per frame at 60 fps: lower = letters return faster
-      diffuse: 0.14,   // smooths the offset map so ribbons stay clean
-      foam: 0.22,      // white water added per frame at full speed
-      foamDecay: 0.955,
-      water: 0.45      // the photo moves less than the letters
-    };
+    const N = 96;
+    const WAKE = { band: 90, drag: 190, ramp: 240, water: 0.55 };   // design px, scaled with the headline
+    const SPEED = 520;                                               // design px per second
 
-    const head = '#version 300 es\nprecision highp float;\n#define ENC ' + ENC + '\n';
-    const codec = `
-      vec3 dec(vec4 t){
-      #if ENC
-        return vec3(t.xy*2.0-1.0, t.z);
-      #else
-        return t.xyz;
-      #endif
-      }
-      vec4 enc(vec3 v){
-      #if ENC
-        return vec4(v.xy*0.5+0.5, v.z, 1.0);
-      #else
-        return vec4(v, 1.0);
-      #endif
-      }`;
     const vs = `#version 300 es
       in vec2 p; out vec2 vUv;
       void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 
-    // xy: drag offset (screen px, y down, normalised by uScale), z: white water
-    const simFs = head + `in vec2 vUv; out vec4 o;
-      uniform sampler2D uPrev; uniform vec2 uMouse; uniform vec2 uDelta; uniform float uFoamAdd;
-      uniform float uBand; uniform float uAspect; uniform float uRelax; uniform float uDiffuse; uniform float uFoamDecay;
-      ${codec}
-      void main(){
-        vec2 t = 1.0/vec2(${SIM}.0);
-        vec3 c = dec(texture(uPrev, vUv));
-        vec3 n = dec(texture(uPrev, vUv + vec2(t.x, 0.0))) + dec(texture(uPrev, vUv - vec2(t.x, 0.0)))
-               + dec(texture(uPrev, vUv + vec2(0.0, t.y))) + dec(texture(uPrev, vUv - vec2(0.0, t.y)));
-        c.xy = mix(c.xy, n.xy*0.25, uDiffuse) * uRelax;
-        c.z *= uFoamDecay;
-        vec2 d = vUv - uMouse; d.x *= uAspect;
-        float g = exp(-dot(d,d)/(uBand*uBand));
-        c.xy += uDelta * g;
-        c.z = min(1.0, c.z + g*uFoamAdd);
-        float L = length(c.xy); if (L > 1.0) c.xy /= L;
-        o = enc(c);
-      }`;
-
-    // all rects are in CSS px of the hero, origin top-left
-    const outFs = head + `in vec2 vUv; out vec4 o;
-      uniform sampler2D uSim; uniform sampler2D uBg; uniform sampler2D uFg; uniform sampler2D uMask;
+    // all positions are CSS px of the hero, origin top-left
+    const fs = `#version 300 es
+      precision highp float;
+      #define N ${N}
+      in vec2 vUv; out vec4 o;
+      uniform sampler2D uBg; uniform sampler2D uFg; uniform sampler2D uMask;
       uniform sampler2D uCatch; uniform sampler2D uFirst; uniform sampler2D uWave;
-      uniform vec2 uRes; uniform vec4 uPhoto; uniform float uScale; uniform float uK; uniform float uWater;
+      uniform vec2 uRes; uniform vec4 uPhoto;
       uniform vec4 uCatchR; uniform vec4 uFirstR; uniform vec4 uWaveR;
-      uniform float uBgP; uniform float uCatchP; uniform float uFirstP; uniform float uWaveP;
-      const vec3 ORANGE = vec3(1.0, 0.384, 0.0);
-      ${codec}
+      uniform float uBgP; uniform float uCatchP; uniform float uFirstP; uniform float uWaveP; uniform float uK;
+      uniform vec2 uPts[N], uNrm[N];
+      uniform float uStep, uHead, uRamp, uBand, uDrag, uWaterMix;
+
       vec4 layer(sampler2D t, vec4 r, vec2 px, float slide){
         vec2 l = (px - r.xy)/r.zw;
         if (l.x < 0.0 || l.x > 1.0 || l.y < 0.0 || l.y > 1.0) return vec4(0.0);
@@ -253,64 +207,66 @@
         if (l.y < 0.0 || l.y > 1.0) return vec4(0.0);
         return texture(t, l);
       }
-      float words(vec2 px){
+      float text(vec2 px){
         return max(layer(uFirst, uFirstR, px, (1.0 - uFirstP)*1.08).a,
                    layer(uWave, uWaveR, px, (1.0 - uWaveP)*1.08).a);
       }
-      vec2 photoUV(vec2 s, float sc){
-        vec2 z = (s - 0.5)/sc + 0.5;
+      vec2 photoUV(vec2 px, float sc){
+        vec2 z = (px/uRes - 0.5)/sc + 0.5;
         return (z*uRes + uPhoto.xy)/uPhoto.zw;
       }
-      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-      float vnoise(vec2 p){
-        vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
-        return mix(mix(hash(i), hash(i+vec2(1,0)), f.x), mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+      // point and normal on the wake at arc length d (points are spaced evenly by uStep)
+      void at(float d, out vec2 P, out vec2 Nn){
+        float f = clamp(d / uStep, 0.0, float(N-1) - 0.001);
+        int i = int(f); float t = f - float(i);
+        P = mix(uPts[i], uPts[i+1], t);
+        Nn = normalize(mix(uNrm[i], uNrm[i+1], t));
       }
+
       void main(){
+        vec2 p = vec2(vUv.x, 1.0 - vUv.y) * uRes;
         float sc = 1.0 + 0.10*(1.0 - uBgP);
-        vec2 s0 = vec2(vUv.x, 1.0 - vUv.y);
-        vec2 px0 = s0*uRes;
-        vec2 q0 = photoUV(s0, sc);
-        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);   // calm water on the surfer
+        vec2 q0 = photoUV(p, sc);
+        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);   // no drag on the surfer herself
 
-        vec3 sim = dec(texture(uSim, vUv));
-        vec2 D = sim.xy * uScale;                 // CSS px, y down: where the water pulled this pixel from
-
-        // photo: dragged less than the letters, and not at all on the surfer
-        vec2 qb = photoUV((px0 - D*uWater*(1.0 - keep))/uRes, sc);
-        vec3 col = texture(uBg, qb).rgb;
-        col = mix(vec3(0.016, 0.19, 0.24), col, smoothstep(0.0, 1.0, uBgP));
-
-        // FIRST WAVE: dragged along the trail. Neighbouring lanes across the trail are averaged and
-        // re-thresholded, so thin slivers merge into a few broad ribbons with clean edges.
-        vec2 p = px0 - D;
-        float dl = length(D);
-        float m = smoothstep(2.0, 26.0*uK, dl);
-        float a = words(p);
-        if (m > 0.0){
-          vec2 nrm = vec2(-D.y, D.x)/max(dl, 1e-4);
-          float step = 2.6*uK*m, acc = 0.0;
-          for (int k = -3; k <= 3; k++) acc += words(p + nrm*step*float(k));
-          a = mix(a, smoothstep(0.3, 0.7, acc/7.0), m);
+        // nearest point on the wake: arc length bs, signed distance sd
+        float best = 1e12, bs = 0.0, sd = 0.0;
+        for (int i = 0; i < N-1; i++){
+          vec2 a = uPts[i], ab = uPts[i+1] - a, ap = p - a;
+          float l2 = max(dot(ab, ab), 1e-6), h = clamp(dot(ap, ab) / l2, 0.0, 1.0);
+          vec2 r = ap - ab * h;
+          float dd = dot(r, r);
+          if (dd < best){ best = dd; bs = (float(i) + h) * uStep; sd = (ab.x * r.y - ab.y * r.x) / sqrt(l2); }
         }
-        col = mix(col, ORANGE, a);
 
-        // white water along the fresh trail: the bright caustic net of the photo, bleached
-        float F = sim.z * (1.0 - keep) * smoothstep(0.0, 1.0, uBgP);
-        if (F > 0.002){
-          float lum = dot(texture(uBg, photoUV(s0, sc)).rgb, vec3(0.3, 0.55, 0.15));
-          float lace = smoothstep(0.4, 0.5, lum + 0.16*vnoise(px0/(7.0*uK)) - 0.04);
-          col = mix(col, vec3(0.95, 0.99, 0.98), lace * pow(F, 0.9) * 0.9 * (1.0 - a));
+        vec3 water = texture(uBg, q0).rgb;
+        float a = text(p);
+        float x = sd / uBand;
+        if (abs(x) < 1.0 && uHead > 0.0){
+          float w = 1.0 - smoothstep(0.0, uRamp, uHead - bs);       // 1 at the head, 0 once it has passed
+          float e = smoothstep(0.0, 1.0, abs(x));
+          float bell = (1.0 - e) * (1.0 - e);
+          float src = max(bs - uDrag * bell * (1.0 - w), 0.0);
+          if (bs < uHead + 1.0 && src < bs - 0.5){
+            vec2 P, Nn; at(src, P, Nn);
+            float acc = 0.0, dl = uBand * 0.05 * bell;
+            for (int k = -3; k <= 3; k++) acc += text(P + Nn * (sd + dl * float(k)));
+            a = mix(text(P + Nn * sd), smoothstep(0.3, 0.7, acc / 7.0), 1.0 - e);
+            at(mix(src, bs, uWaterMix), P, Nn);
+            water = mix(texture(uBg, photoUV(P + Nn * sd, sc)).rgb, water, keep);
+          }
         }
+
+        vec3 col = mix(vec3(0.016, 0.19, 0.24), water, smoothstep(0.0, 1.0, uBgP));
+        col = mix(col, vec3(1.0, 0.384, 0.0), a);
 
         // the surfer stays still and sharp
         vec4 f = texture(uFg, q0);
         col = mix(col, f.rgb, f.a * smoothstep(0.0, 1.0, uBgP));
 
         // CATCH YOUR: rises and fades in, never dragged
-        vec4 c = layer(uCatch, uCatchR, px0 - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
+        vec4 c = layer(uCatch, uCatchR, p - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
         col = mix(col, c.rgb, c.a * uCatchP);
-
         o = vec4(col, 1.0);
       }`;
 
@@ -319,157 +275,126 @@
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
       return s;
     }
-    function prog(f) {
-      const p = gl.createProgram();
-      gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, f));
-      gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
-      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-      const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
-      for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
-      return { p, u };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(prog, 0, 'p'); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    const U = {};
+    for (let i = 0, n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS); i < n; i++) {
+      const name = gl.getActiveUniform(prog, i).name.replace(/\[0\]$/, '');
+      U[name] = gl.getUniformLocation(prog, name);
     }
-    const PS = prog(simFs), PO = prog(outFs);
 
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-    function params() {
+    function imgTex(i, mip) {
+      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    }
-    function imgTex(i, mip) {
-      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); params();
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, i);
       if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
       return t;
     }
-    // soft, slightly grown silhouette of the surfer: the water stays calm inside it
+    // soft, slightly grown silhouette of the surfer
     const mc = document.createElement('canvas'); mc.width = 480; mc.height = 270;
     const mx = mc.getContext('2d'); mx.filter = 'blur(5px)';
     for (let i = 0; i < 3; i++) mx.drawImage(img.surfer, 0, 0, 480, 270);
-    const T = {
-      bg: imgTex(img.bg, true), fg: imgTex(img.surfer, true), mask: imgTex(mc),
-      cat: imgTex(img.cat, true), first: imgTex(img.first, true), wave: imgTex(img.wave, true)
-    };
-
-    const simTex = [], simFbo = [];
-    for (let i = 0; i < 2; i++) {
-      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
-      if (ENC) {
-        const d = new Uint8Array(SIM * SIM * 4);
-        for (let j = 0; j < d.length; j += 4) { d[j] = 128; d[j + 1] = 128; d[j + 3] = 255; }
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SIM, SIM, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
-      } else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, SIM, SIM, 0, gl.RGBA, gl.HALF_FLOAT, null);
-      params();
-      const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-      if (!ENC) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
-      simTex.push(t); simFbo.push(fb);
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const tex = [
+      ['uBg', imgTex(img.bg, true)], ['uFg', imgTex(img.surfer, true)], ['uMask', imgTex(mc)],
+      ['uCatch', imgTex(img.cat, true)], ['uFirst', imgTex(img.first, true)], ['uWave', imgTex(img.wave, true)]
+    ];
+    tex.forEach(([name, t], unit) => {
+      gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(U[name], unit);
+    });
 
     hero.classList.add('is-gl');
 
-    function resize() {
+    /* ---- wake path: evenly spaced samples with normals smoothed over the neighbours ---- */
+    let wakeLen = 1, layoutKey = '';
+    function uploadWake() {
+      const dense = [];
+      const steps = 400;
+      for (let i = 0; i <= steps; i++) dense.push(pathAt(i / steps));
+      const cum = [0];
+      for (let i = 1; i < dense.length; i++) cum.push(cum[i - 1] + Math.hypot(dense[i][0] - dense[i - 1][0], dense[i][1] - dense[i - 1][1]));
+      wakeLen = cum[cum.length - 1] || 1;
+      const along = d => {
+        d = clamp(d, 0, wakeLen);
+        let lo = 0, hi = cum.length - 1;
+        while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= d) lo = m; else hi = m; }
+        const t = (d - cum[lo]) / Math.max(cum[hi] - cum[lo], 1e-6);
+        return [dense[lo][0] + (dense[hi][0] - dense[lo][0]) * t, dense[lo][1] + (dense[hi][1] - dense[lo][1]) * t];
+      };
+      const pts = [], nrm = [];
+      for (let i = 0; i < N; i++) pts.push(along(wakeLen * i / (N - 1)));
+      for (let i = 0; i < N; i++) {
+        const a = along(wakeLen * (i - 1) / (N - 1)), b = along(wakeLen * (i + 1) / (N - 1));
+        const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+        nrm.push([-(b[1] - a[1]) / l, (b[0] - a[0]) / l]);
+      }
+      gl.uniform2fv(U.uPts, new Float32Array(pts.flat()));
+      gl.uniform2fv(U.uNrm, new Float32Array(nrm.flat()));
+      gl.uniform1f(U.uStep, wakeLen / (N - 1));
+      gl.uniform1f(U.uBand, WAKE.band * L.k);
+      gl.uniform1f(U.uDrag, WAKE.drag * L.k);
+      gl.uniform1f(U.uRamp, WAKE.ramp * L.k);
+      gl.uniform1f(U.uWaterMix, WAKE.water);
+    }
+
+    // lighter canvas while the wake moves, full sharpness for the still frame (as in Lowtide)
+    function resize(moving) {
       const dpr = Math.min(devicePixelRatio || 1, 2);
-      const w = Math.max(1, Math.round(L.W * dpr)), h = Math.max(1, Math.round(L.H * dpr));
+      const q = moving ? Math.min(1, Math.sqrt(2.2e6 / (L.W * L.H))) : dpr;
+      const w = Math.max(1, Math.round(L.W * q)), h = Math.max(1, Math.round(L.H * q));
       if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
     }
 
-    /* ---- input (CSS px inside the hero) ---- */
-    const cur = { x: 0, y: 0 }, last = { x: 0, y: 0 };
-    let lastInput = -1e9, auto = null, lastAutoEnd = 0, armed = false;
-    function setFrom(e) { const r = hero.getBoundingClientRect(); cur.x = e.clientX - r.left; cur.y = e.clientY - r.top; }
-    hero.addEventListener('pointerenter', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
-    hero.addEventListener('pointerdown', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
-    hero.addEventListener('pointermove', e => {
-      if (auto) { auto = null; setFrom(e); last.x = cur.x; last.y = cur.y; }
-      setFrom(e); lastInput = performance.now();
-    });
-    // steady speed like Lowtide, easing in and out only at the very ends
-    function rideEase(t) {
-      const a = 0.12, b = 0.82, v = 1 / (1 - a / 2 - (1 - b) / 2);
-      if (t < a) return v * t * t / (2 * a);
-      if (t < b) return v * (a / 2 + (t - a));
-      const u = t - b, r = 1 - b;
-      return v * (a / 2 + (b - a) + u - u * u / (2 * r));
-    }
-    function startAuto(now) {
-      const dur = clamp(3200 * L.total / (1500 * L.k), 2400, 4600);
-      auto = { t0: now, dur };
-      const p = pathAt(0); cur.x = last.x = p[0]; cur.y = last.y = p[1];
-    }
-
-    /* ---- intro timeline (seconds) ---- */
+    /* ---- timeline ---- */
     const ease = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
     const span = (t, a, b) => ease((t - a) / (b - a));
+    // steady speed, then a short ease-out so the wake does not stop dead (as in Lowtide)
+    const t1 = 0.86, sp = 2 / (1 + t1), p1 = sp * t1;
+    const ride = t => t < t1 ? sp * t : p1 + sp * ((t - t1) - (t - t1) ** 2 / (2 * (1 - t1)));
+    const RIDE_AT = 2.0;                                  // s, after the headline has risen
     const T0 = performance.now();
     startDOM(reduce ? 0 : 1250);
-    setTimeout(() => { armed = true; if (!reduce) startAuto(performance.now()); }, reduce ? 0 : 2300);
 
-    let swap = 0, visible = true, prevNow = performance.now();
-    new IntersectionObserver(([e]) => { visible = e.isIntersecting; }).observe(hero);
-
+    let done = false;
     function frame(now) {
-      requestAnimationFrame(frame);
-      const dt = clamp((now - prevNow) / 1000, 0, 0.1); prevNow = now;
-      if (!visible || document.hidden) return;
-      resize();
       const t = reduce ? 99 : (now - T0) / 1000;
+      const key = [L.W, L.H, ...L.words.first, ...L.words.wave].map(v => Math.round(v)).join(',');
+      if (key !== layoutKey) { layoutKey = key; uploadWake(); }
+      const dur = sp * (wakeLen / L.k) / SPEED;
+      resize(!reduce && t < RIDE_AT + dur);
+      gl.viewport(0, 0, canvas.width, canvas.height);
 
-      if (auto) {
-        const k = (now - auto.t0) / auto.dur;
-        if (k >= 1) { auto = null; lastAutoEnd = now; }
-        else { const p = pathAt(rideEase(k)); cur.x = p[0]; cur.y = p[1]; }
-      } else if (armed && !reduce && now - lastInput > 6000 && now - lastAutoEnd > 4500) {
-        startAuto(now);
-      }
-      let dx = cur.x - last.x, dy = cur.y - last.y;
-      last.x = cur.x; last.y = cur.y;
-      const step = Math.hypot(dx, dy), cap = 90 * L.k;
-      if (step > cap) { dx *= cap / step; dy *= cap / step; }      // ignore jumps (touch, tab switch)
-      const scale = WAKE.max * L.k;
-      const fr = dt * 60;
-
-      const src = swap, dst = 1 - swap;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, simFbo[dst]); gl.viewport(0, 0, SIM, SIM);
-      gl.useProgram(PS.p);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex[src]); gl.uniform1i(PS.u.uPrev, 0);
-      gl.uniform2f(PS.u.uMouse, cur.x / L.W, 1 - cur.y / L.H);
-      gl.uniform2f(PS.u.uDelta, dx * WAKE.gain / scale, dy * WAKE.gain / scale);
-      gl.uniform1f(PS.u.uFoamAdd, WAKE.foam * Math.min(1, step / (8 * L.k)));
-      gl.uniform1f(PS.u.uBand, WAKE.band * L.k / L.H);
-      gl.uniform1f(PS.u.uAspect, L.W / L.H);
-      gl.uniform1f(PS.u.uRelax, Math.pow(WAKE.relax, fr));
-      gl.uniform1f(PS.u.uDiffuse, WAKE.diffuse);
-      gl.uniform1f(PS.u.uFoamDecay, Math.pow(WAKE.foamDecay, fr));
-      gl.drawArrays(gl.TRIANGLES, 0, 3); swap = dst;
-
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.useProgram(PO.p);
-      const bind = (unit, tex, name) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(PO.u[name], unit); };
-      bind(0, simTex[dst], 'uSim'); bind(1, T.bg, 'uBg'); bind(2, T.fg, 'uFg'); bind(3, T.mask, 'uMask');
-      bind(4, T.cat, 'uCatch'); bind(5, T.first, 'uFirst'); bind(6, T.wave, 'uWave');
-      gl.uniform2f(PO.u.uRes, L.W, L.H);
-      gl.uniform4f(PO.u.uPhoto, ...L.photo);
-      gl.uniform1f(PO.u.uScale, scale);
-      gl.uniform1f(PO.u.uK, L.k);
-      gl.uniform1f(PO.u.uWater, WAKE.water);
-      gl.uniform4f(PO.u.uCatchR, ...L.words.catch);
-      gl.uniform4f(PO.u.uFirstR, ...L.words.first);
-      gl.uniform4f(PO.u.uWaveR, ...L.words.wave);
-      gl.uniform1f(PO.u.uBgP, span(t, 0, 1.6));
-      gl.uniform1f(PO.u.uCatchP, span(t, 0.45, 1.35));
-      gl.uniform1f(PO.u.uFirstP, span(t, 0.65, 1.45));
-      gl.uniform1f(PO.u.uWaveP, span(t, 0.82, 1.62));
+      const head = reduce ? wakeLen : wakeLen * ride(clamp((t - RIDE_AT) / dur, 0, 1));
+      gl.uniform1f(U.uHead, head);
+      gl.uniform2f(U.uRes, L.W, L.H);
+      gl.uniform4f(U.uPhoto, ...L.photo);
+      gl.uniform1f(U.uK, L.k);
+      gl.uniform4f(U.uCatchR, ...L.words.catch);
+      gl.uniform4f(U.uFirstR, ...L.words.first);
+      gl.uniform4f(U.uWaveR, ...L.words.wave);
+      gl.uniform1f(U.uBgP, span(t, 0, 1.6));
+      gl.uniform1f(U.uCatchP, span(t, 0.45, 1.35));
+      gl.uniform1f(U.uFirstP, span(t, 0.65, 1.45));
+      gl.uniform1f(U.uWaveP, span(t, 0.82, 1.62));
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      // after the ride only redraw when the layout changes
+      done = t > RIDE_AT + dur + 0.2;
+      if (!done) requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
+    new ResizeObserver(() => { if (done) requestAnimationFrame(frame); }).observe(hero);
   }
 })();
