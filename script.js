@@ -47,7 +47,7 @@
   }
 
   /* ---------- geometry ---------- */
-  // The photo and the surfer cut-out share one 1920 × 1080 frame.
+  // The photo and the surfer cut-out share one frame, measured in 1920 × 1080 units (files are 3840 × 2160).
   const PHOTO_W = 1920, PHOTO_H = 1080;
   const FOCUS = [0.286, 0.52];                 // the surfer, kept in view on narrow screens
   const SURFER_PT = [662, 595];                 // where the wave starts, in photo px
