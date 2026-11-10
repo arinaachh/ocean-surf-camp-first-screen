@@ -276,7 +276,7 @@
         if (l.x < 0.0 || l.x > 1.0 || l.y < 0.0 || l.y > 1.0) return vec4(0.0);
         l.y -= slide;
         if (l.y < 0.0 || l.y > 1.0) return vec4(0.0);
-        return texture(t, l);
+        return texture(t, l, -0.6);   // negative LOD bias: crisp edges when the word is drawn smaller
       }
       vec2 photoUV(vec2 s, float sc){
         vec2 z = (s - 0.5)/sc + 0.5;
@@ -294,7 +294,8 @@
         vec2 px = s*uRes;
         vec2 q = photoUV(s, sc);
 
-        vec3 col = texture(uBg, q).rgb;
+        // negative LOD bias: trilinear filtering otherwise blends in the half-size mip level and softens the photo
+        vec3 col = texture(uBg, q, -0.9).rgb;
         col = mix(vec3(0.016, 0.19, 0.24), col, smoothstep(0.0, 1.0, uBgP));
 
         // FIRST and WAVE: each word slides up out of its own mask, and bends with the water
@@ -304,7 +305,7 @@
         col = mix(col, h.rgb, h.a);
 
         // the surfer stays still and sharp
-        vec4 f = texture(uFg, q0);
+        vec4 f = texture(uFg, q0, -0.9);
         col = mix(col, f.rgb, f.a * smoothstep(0.0, 1.0, uBgP));
 
         // CATCH YOUR: rises and fades in, never distorted
