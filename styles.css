@@ -101,6 +101,9 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
   line-height: .89;
   letter-spacing: -.06em;
   text-align: center;
+  /* the logo can sit on white spray or on teal water: a soft dark halo keeps it readable on both */
+  font-weight: 600;
+  text-shadow: 0 0 2px rgba(4, 48, 61, .35), 0 1px 10px rgba(4, 48, 61, .55), 0 0 22px rgba(4, 48, 61, .35);
 }
 .logo span { display: block; }
 
