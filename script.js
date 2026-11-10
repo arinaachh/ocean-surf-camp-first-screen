@@ -1,8 +1,8 @@
 /* Ocean Surf Camp: first screen
    - Layout is plain HTML/CSS. The script only reads where the headline words sit
      and draws photo + headline + surfer on a WebGL canvas behind the copy.
-   - The water effect: ripples (wave equation) from the cursor or from the default wave
-     refract the photo and FIRST WAVE. "CATCH YOUR" and the surfer stay sharp.
+   - The water effect: a small velocity field (ping-pong textures) bends the photo,
+     FIRST and WAVE. "CATCH YOUR" and the surfer stay sharp.
    - Without WebGL the plain <img> layers stay visible. */
 (function () {
   'use strict';
@@ -175,24 +175,50 @@
     requestAnimationFrame(() => { resizeQueued = false; layout(); centerLabels(); });
   }).observe(hero);
 
-  /* ---------- WebGL ----------
-     Water: a height field driven by the wave equation. The cursor (or the default wave from the
-     surfer) disturbs the surface; ripples spread out in rings, cross each other and die down.
-     The photo and FIRST WAVE are refracted by the slope of the surface, the way the sea floor
-     wobbles under moving water. "CATCH YOUR" and the surfer stay sharp. */
+  /* ---------- live tuning: open the page with ?tune ---------- */
+  function tunePanel(SET) {
+    const q = new URLSearchParams(location.search);
+    for (const k in SET) if (q.has(k)) SET[k] = parseFloat(q.get(k)) || SET[k];
+    if (!q.has('tune')) return;
+    const R = {
+      radius:   [10, 90, 1,      'Cursor size'],
+      strength: [0.01, 0.2, 0.005, 'Stretch'],
+      gain:     [2, 20, 0.5,     'Push'],
+      advect:   [0, 0.08, 0.002, 'Flow'],
+      decay:    [0.9, 0.995, 0.001, 'Life'],
+      swirl:    [0, 0.04, 0.001, 'Swirl']
+    };
+    const box = document.createElement('div');
+    box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:99;padding:12px 14px;border-radius:12px;' +
+      'background:rgba(4,48,61,.92);color:#fff;font:12px/1.3 Inter,system-ui,sans-serif;text-transform:none;width:240px';
+    const out = document.createElement('code');
+    out.style.cssText = 'display:block;margin-top:8px;word-break:break-all;opacity:.85;user-select:all';
+    const show = () => { out.textContent = Object.keys(R).map(k => k + '=' + SET[k]).join('&'); };
+    for (const k in R) {
+      const [mn, mx, st, label] = R[k];
+      const row = document.createElement('label');
+      row.style.cssText = 'display:grid;grid-template-columns:78px 1fr 44px;align-items:center;gap:6px;margin:3px 0';
+      const val = document.createElement('span'); val.textContent = SET[k];
+      const inp = document.createElement('input');
+      Object.assign(inp, { type: 'range', min: mn, max: mx, step: st, value: SET[k] });
+      inp.addEventListener('input', () => { SET[k] = parseFloat(inp.value); val.textContent = inp.value; show(); });
+      row.append(label, inp, val); box.append(row);
+    }
+    box.append(out); show();
+    box.addEventListener('pointermove', e => e.stopPropagation());
+    document.body.append(box);
+  }
+
+  /* ---------- WebGL ---------- */
   function runGL(gl, img) {
     const floatOK = !!gl.getExtension('EXT_color_buffer_float');
     const ENC = floatOK ? 0 : 1;
-    const WATER = {
-      cell: 5,          // CSS px per simulation cell (smaller = finer ripples)
-      steps: 2,         // simulation steps per frame (more = ripples travel faster)
-      damping: 0.988,   // per step: lower = ripples die out sooner
-      drop: 26,         // radius of the disturbance under the cursor, design px
-      amount: 0.25,     // how hard a moving cursor pushes the surface
-      refract: 38,      // offset of letters per unit of slope, design px (≈ 25 px at most)
-      photo: 0.6,       // the photo is refracted less than the letters
-      shine: 0.07       // soft light on the ripple slopes (photo only)
-    };
+    const SIM = 320;
+    // Water settings. First version: strength .075, radius 54, decay .976, swirl .016, advect .012, gain 7.
+    // Smaller cursor, no swirl (the swirl made letters wobble like jelly), stronger flow so letters
+    // are carried and stretched along the cursor's path, and a slightly shorter life.
+    const SET = { strength: 0.075, radius: 32, decay: 0.968, swirl: 0, advect: 0.03, gain: 9.0 };
+    tunePanel(SET);
 
     const head = '#version 300 es\nprecision highp float;\n#define ENC ' + ENC + '\n';
     const codec = `
@@ -205,41 +231,40 @@
       }
       vec4 enc(vec2 v){
       #if ENC
-        return vec4(clamp(v*0.5+0.5, 0.0, 1.0), 0.0, 1.0);
+        return vec4(v*0.5+0.5,0.0,1.0);
       #else
-        return vec4(v, 0.0, 1.0);
+        return vec4(v,0.0,1.0);
       #endif
       }`;
     const vs = `#version 300 es
       in vec2 p; out vec2 vUv;
       void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 
-    // x: height now, y: height one step ago
     const simFs = head + `in vec2 vUv; out vec4 o;
-      uniform sampler2D uPrev; uniform vec2 uTexel;
-      uniform vec2 uA; uniform vec2 uB; uniform float uDrop; uniform float uAmount; uniform float uDamping;
+      uniform sampler2D uPrev; uniform vec2 uMouse; uniform vec2 uMouse0; uniform vec2 uVel;
+      uniform float uRadius; uniform float uDecay; uniform float uAspect; uniform float uSwirl; uniform float uAdvect;
       ${codec}
-      float segDist(vec2 p, vec2 a, vec2 b){
-        vec2 ab = b - a; float h = clamp(dot(p - a, ab)/max(dot(ab, ab), 1e-6), 0.0, 1.0);
-        return length(p - a - ab*h);
-      }
       void main(){
-        vec2 c = dec(texture(uPrev, vUv));
-        float n = dec(texture(uPrev, vUv + vec2(uTexel.x, 0.0))).x + dec(texture(uPrev, vUv - vec2(uTexel.x, 0.0))).x
-                + dec(texture(uPrev, vUv + vec2(0.0, uTexel.y))).x + dec(texture(uPrev, vUv - vec2(0.0, uTexel.y))).x;
-        float h = (n*0.5 - c.y) * uDamping;
-        // push the surface down along the cursor's last move (in cells)
-        vec2 p = vUv / uTexel;
-        float d = segDist(p, uA, uB);
-        h -= uAmount * exp(-d*d/(uDrop*uDrop));
-        o = enc(vec2(clamp(h, -4.0, 4.0), c.x));
+        vec2 v0 = dec(texture(uPrev, vUv));
+        vec2 v = dec(texture(uPrev, vUv - v0*uAdvect));
+        float s = sin(uSwirl), c = cos(uSwirl);
+        v = mat2(c, s, -s, c) * v;
+        v *= uDecay;
+        // push along the whole segment the cursor moved this frame, so the trail stays smooth
+        vec2 a = uMouse0, ab = uMouse - uMouse0; a.x *= uAspect; ab.x *= uAspect;
+        vec2 pp = vUv; pp.x *= uAspect;
+        float h = clamp(dot(pp - a, ab)/max(dot(ab, ab), 1e-9), 0.0, 1.0);
+        vec2 d = pp - a - ab*h;
+        v += uVel * exp(-dot(d,d)/(uRadius*uRadius));
+        float L = length(v); if (L > 1.0) v /= L;
+        o = enc(v);
       }`;
 
     // all rects are in CSS px of the hero, origin top-left
     const outFs = head + `in vec2 vUv; out vec4 o;
       uniform sampler2D uSim; uniform sampler2D uBg; uniform sampler2D uFg; uniform sampler2D uMask;
       uniform sampler2D uCatch; uniform sampler2D uFirst; uniform sampler2D uWave;
-      uniform vec2 uRes; uniform vec4 uPhoto; uniform vec2 uTexel; uniform float uRefract; uniform float uPhotoK; uniform float uShine; uniform float uK;
+      uniform vec2 uRes; uniform vec4 uPhoto; uniform vec2 uStr; uniform float uK;
       uniform vec4 uCatchR; uniform vec4 uFirstR; uniform vec4 uWaveR;
       uniform float uBgP; uniform float uCatchP; uniform float uFirstP; uniform float uWaveP;
       ${codec}
@@ -250,38 +275,41 @@
         if (l.y < 0.0 || l.y > 1.0) return vec4(0.0);
         return texture(t, l);
       }
-      vec2 photoUV(vec2 px, float sc){
-        vec2 z = (px/uRes - 0.5)/sc + 0.5;
+      vec2 photoUV(vec2 s, float sc){
+        vec2 z = (s - 0.5)/sc + 0.5;
         return (z*uRes + uPhoto.xy)/uPhoto.zw;
       }
       void main(){
         float sc = 1.0 + 0.10*(1.0 - uBgP);
-        vec2 px0 = vec2(vUv.x, 1.0 - vUv.y) * uRes;
-        vec2 q0 = photoUV(px0, sc);
-        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);   // calm water on the surfer
+        vec2 s0 = vec2(vUv.x, 1.0 - vUv.y);
+        vec2 q0 = photoUV(s0, sc);
+        // keep the water calm on and right around the surfer
+        float keep = smoothstep(0.04, 0.45, texture(uMask, q0).a);
+        vec2 v = dec(texture(uSim, vUv)) * (1.0 - keep);
+        vec2 uv = vUv - v*uStr;
+        vec2 s = vec2(uv.x, 1.0 - uv.y);
+        vec2 px = s*uRes;
+        vec2 q = photoUV(s, sc);
 
-        // slope of the surface (screen orientation, y down)
-        float hx = dec(texture(uSim, vUv + vec2(uTexel.x, 0.0))).x - dec(texture(uSim, vUv - vec2(uTexel.x, 0.0))).x;
-        float hy = dec(texture(uSim, vUv - vec2(0.0, uTexel.y))).x - dec(texture(uSim, vUv + vec2(0.0, uTexel.y))).x;
-        vec2 slope = vec2(hx, hy) * (1.0 - keep);
-        vec2 off = slope * uRefract;
-
-        vec3 col = texture(uBg, photoUV(px0 + off*uPhotoK, sc)).rgb;
-        // soft light where the ripples tilt toward the top-left
-        col += uShine * clamp(dot(slope, vec2(-0.6, -0.8)) * 3.0, -1.0, 1.0);
+        vec3 col = texture(uBg, q).rgb;
         col = mix(vec3(0.016, 0.19, 0.24), col, smoothstep(0.0, 1.0, uBgP));
 
-        vec2 p = px0 + off;
-        vec4 h = layer(uFirst, uFirstR, p, (1.0 - uFirstP)*1.08);
+        // FIRST and WAVE: each word slides up out of its own mask, and bends with the water
+        vec4 h = layer(uFirst, uFirstR, px, (1.0 - uFirstP)*1.08);
         col = mix(col, h.rgb, h.a);
-        h = layer(uWave, uWaveR, p, (1.0 - uWaveP)*1.08);
+        h = layer(uWave, uWaveR, px, (1.0 - uWaveP)*1.08);
         col = mix(col, h.rgb, h.a);
 
+        // the surfer stays still and sharp
         vec4 f = texture(uFg, q0);
         col = mix(col, f.rgb, f.a * smoothstep(0.0, 1.0, uBgP));
 
-        vec4 c = layer(uCatch, uCatchR, px0 - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
+        // CATCH YOUR: rises and fades in, never distorted
+        vec4 c = layer(uCatch, uCatchR, s0*uRes - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
         col = mix(col, c.rgb, c.a * uCatchP);
+
+        // faint sheen where the water is pulled hardest
+        col += vec3(0.85, 1.0, 1.0) * smoothstep(0.35, 1.0, length(v)) * 0.08;
         o = vec4(col, 1.0);
       }`;
 
@@ -320,6 +348,7 @@
       if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
       return t;
     }
+    // soft, slightly grown silhouette of the surfer: the water effect fades out inside it
     const mc = document.createElement('canvas'); mc.width = 480; mc.height = 270;
     const mx = mc.getContext('2d'); mx.filter = 'blur(5px)';
     for (let i = 0; i < 3; i++) mx.drawImage(img.surfer, 0, 0, 480, 270);
@@ -328,28 +357,21 @@
       cat: imgTex(img.cat, true), first: imgTex(img.first, true), wave: imgTex(img.wave, true)
     };
 
-    /* ---- simulation grid: one cell per WATER.cell CSS px, rebuilt when the hero changes size ---- */
-    let SW = 0, SH = 0, simTex = [], simFbo = [];
-    function buildSim() {
-      const w = Math.max(16, Math.round(L.W / WATER.cell)), h = Math.max(16, Math.round(L.H / WATER.cell));
-      if (w === SW && h === SH) return;
-      simTex.forEach(t => gl.deleteTexture(t)); simFbo.forEach(f => gl.deleteFramebuffer(f));
-      simTex = []; simFbo = []; SW = w; SH = h;
-      for (let i = 0; i < 2; i++) {
-        const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
-        if (ENC) {
-          const d = new Uint8Array(SW * SH * 4);
-          for (let j = 0; j < d.length; j += 4) { d[j] = 128; d[j + 1] = 128; d[j + 3] = 255; }
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SW, SH, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
-        } else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, SW, SH, 0, gl.RGBA, gl.HALF_FLOAT, null);
-        params();
-        const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-        if (!ENC) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
-        simTex.push(t); simFbo.push(fb);
-      }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const simTex = [], simFbo = [];
+    for (let i = 0; i < 2; i++) {
+      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      if (ENC) {
+        const d = new Uint8Array(SIM * SIM * 4);
+        for (let j = 0; j < d.length; j += 4) { d[j] = 128; d[j + 1] = 128; d[j + 3] = 255; }
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SIM, SIM, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+      } else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, SIM, SIM, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      params();
+      const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      if (!ENC) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+      simTex.push(t); simFbo.push(fb);
     }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
     hero.classList.add('is-gl');
 
@@ -360,17 +382,17 @@
     }
 
     /* ---- input (CSS px inside the hero) ---- */
-    const cur = { x: -1e4, y: -1e4 }, last = { x: -1e4, y: -1e4 };
+    const cur = { x: 0, y: 0 }, last = { x: 0, y: 0 };
     let lastInput = -1e9, auto = null, lastAutoEnd = 0, armed = false;
     function setFrom(e) { const r = hero.getBoundingClientRect(); cur.x = e.clientX - r.left; cur.y = e.clientY - r.top; }
     hero.addEventListener('pointerenter', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
-    hero.addEventListener('pointerdown', e => { setFrom(e); last.x = cur.x; last.y = cur.y; });
     hero.addEventListener('pointermove', e => {
       if (auto) { auto = null; setFrom(e); last.x = cur.x; last.y = cur.y; }
       setFrom(e); lastInput = performance.now();
     });
     function startAuto(now) {
-      auto = { t0: now, dur: clamp(3000 * L.total / (1500 * L.k), 2200, 4200) };
+      const dur = clamp(3000 * L.total / (1500 * L.k), 2200, 4200);
+      auto = { t0: now, dur };
       const p = pathAt(0); cur.x = last.x = p[0]; cur.y = last.y = p[1];
     }
 
@@ -387,7 +409,7 @@
     function frame(now) {
       requestAnimationFrame(frame);
       if (!visible || document.hidden) return;
-      resize(); buildSim();
+      resize();
       const t = reduce ? 99 : (now - T0) / 1000;
 
       if (auto) {
@@ -397,41 +419,33 @@
       } else if (armed && !reduce && now - lastInput > 5000 && now - lastAutoEnd > 3500) {
         startAuto(now);
       }
-      const move = Math.hypot(cur.x - last.x, cur.y - last.y);
-      // a still cursor makes no ripples; jumps (touch, re-entry) are ignored
-      const amount = (!auto && move > 250 * L.k) ? 0 : WATER.amount * Math.min(1, move / (10 * L.k)) / WATER.steps;
-      const toCell = (x, y) => [x / WATER.cell, (L.H - y) / WATER.cell];
-      const A = toCell(last.x, last.y), B = toCell(cur.x, cur.y);
+      // velocity in the same units the Figma frame used, scaled with the headline size
+      const m0x = last.x / L.W, m0y = 1 - last.y / L.H;
+      // same push per px travelled at any frame rate: a long step does not hit harder
+      const stepPx = Math.hypot(cur.x - last.x, cur.y - last.y);
+      const capK = Math.min(1, 1.8 * SET.radius * L.k / Math.max(stepPx, 1e-6));
+      const vx = (cur.x - last.x) * capK * SET.gain / (1920 * L.k);
+      const vy = -(cur.y - last.y) * capK * SET.gain / (1080 * L.k);
       last.x = cur.x; last.y = cur.y;
 
+      const src = swap, dst = 1 - swap;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, simFbo[dst]); gl.viewport(0, 0, SIM, SIM);
       gl.useProgram(PS.p);
-      gl.viewport(0, 0, SW, SH);
-      gl.uniform2f(PS.u.uTexel, 1 / SW, 1 / SH);
-      gl.uniform1f(PS.u.uDrop, WATER.drop * L.k / WATER.cell);
-      gl.uniform1f(PS.u.uDamping, WATER.damping);
-      for (let i = 0; i < WATER.steps; i++) {
-        const src = swap, dst = 1 - swap;
-        gl.bindFramebuffer(gl.FRAMEBUFFER, simFbo[dst]);
-        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex[src]); gl.uniform1i(PS.u.uPrev, 0);
-        // spread the move over the sub-steps
-        const a = i / WATER.steps, b = (i + 1) / WATER.steps;
-        gl.uniform2f(PS.u.uA, A[0] + (B[0] - A[0]) * a, A[1] + (B[1] - A[1]) * a);
-        gl.uniform2f(PS.u.uB, A[0] + (B[0] - A[0]) * b, A[1] + (B[1] - A[1]) * b);
-        gl.uniform1f(PS.u.uAmount, amount);
-        gl.drawArrays(gl.TRIANGLES, 0, 3); swap = dst;
-      }
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex[src]); gl.uniform1i(PS.u.uPrev, 0);
+      gl.uniform2f(PS.u.uMouse, cur.x / L.W, 1 - cur.y / L.H); gl.uniform2f(PS.u.uMouse0, m0x, m0y);
+      gl.uniform2f(PS.u.uVel, vx, vy);
+      gl.uniform1f(PS.u.uRadius, SET.radius * L.k / L.H); gl.uniform1f(PS.u.uDecay, SET.decay);
+      gl.uniform1f(PS.u.uAspect, L.W / L.H); gl.uniform1f(PS.u.uSwirl, SET.swirl); gl.uniform1f(PS.u.uAdvect, SET.advect);
+      gl.drawArrays(gl.TRIANGLES, 0, 3); swap = dst;
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
       gl.useProgram(PO.p);
       const bind = (unit, tex, name) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(PO.u[name], unit); };
-      bind(0, simTex[swap], 'uSim'); bind(1, T.bg, 'uBg'); bind(2, T.fg, 'uFg'); bind(3, T.mask, 'uMask');
+      bind(0, simTex[dst], 'uSim'); bind(1, T.bg, 'uBg'); bind(2, T.fg, 'uFg'); bind(3, T.mask, 'uMask');
       bind(4, T.cat, 'uCatch'); bind(5, T.first, 'uFirst'); bind(6, T.wave, 'uWave');
       gl.uniform2f(PO.u.uRes, L.W, L.H);
       gl.uniform4f(PO.u.uPhoto, ...L.photo);
-      gl.uniform2f(PO.u.uTexel, 1 / SW, 1 / SH);
-      gl.uniform1f(PO.u.uRefract, WATER.refract * L.k);
-      gl.uniform1f(PO.u.uPhotoK, WATER.photo);
-      gl.uniform1f(PO.u.uShine, WATER.shine);
+      gl.uniform2f(PO.u.uStr, SET.strength * 1920 * L.k / L.W, SET.strength * 1080 * L.k / L.H);
       gl.uniform1f(PO.u.uK, L.k);
       gl.uniform4f(PO.u.uCatchR, ...L.words.catch);
       gl.uniform4f(PO.u.uFirstR, ...L.words.first);
