@@ -186,7 +186,9 @@
       gain:     [2, 20, 0.5,     'Push'],
       advect:   [0, 0.08, 0.002, 'Flow'],
       decay:    [0.9, 0.995, 0.001, 'Life'],
-      swirl:    [0, 0.04, 0.001, 'Swirl']
+      swirl:    [0, 0.04, 0.001, 'Swirl'],
+      waveSpeed:[150, 1400, 10,  'Wave speed'],
+      wavePush: [0.3, 3, 0.05,   'Wave push']
     };
     const box = document.createElement('div');
     box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:99;padding:12px 14px;border-radius:12px;' +
@@ -217,7 +219,8 @@
     // Water settings. First version: strength .075, radius 54, decay .976, swirl .016, advect .012, gain 7.
     // Smaller cursor, no swirl (the swirl made letters wobble like jelly), stronger flow so letters
     // are carried and stretched along the cursor's path, and a slightly shorter life.
-    const SET = { strength: 0.13, radius: 37, decay: 0.973, swirl: 0, advect: 0.02, gain: 7.0 };   // tuned by Arina
+    const SET = { strength: 0.13, radius: 37, decay: 0.973, swirl: 0, advect: 0.02, gain: 7.0,   // tuned by Arina
+                  waveSpeed: 350, wavePush: 1 };   // default wave: design px per second, extra push
     tunePanel(SET);
 
     const head = '#version 300 es\nprecision highp float;\n#define ENC ' + ENC + '\n';
@@ -390,9 +393,10 @@
       if (auto) { auto = null; setFrom(e); last.x = cur.x; last.y = cur.y; }
       setFrom(e); lastInput = performance.now();
     });
-    // The default wave moves like a hand swipe: steady speed, short ease in and out.
-    // (It used to be 2-3x slower than a real cursor and sped up and slowed down, so its trail looked different.)
-    const AUTO_SPEED = 1100;                      // design px per second
+    // The default wave moves at a steady speed with a short ease in and out. It can be slow and still
+    // push the water as hard as a cursor swipe (~1100 px/s): the push is raised to match the swipe's peak.
+    const SWIPE = 1100;
+    const waveBoost = () => SET.wavePush * Math.pow(SWIPE / SET.waveSpeed, 0.18);
     function swipe(t) {
       const a = 0.15, b = 0.85, v = 1 / (1 - a / 2 - (1 - b) / 2);
       if (t < a) return v * t * t / (2 * a);
@@ -401,7 +405,7 @@
       return v * (a / 2 + (b - a) + u - u * u / (2 * r));
     }
     function startAuto(now) {
-      const dur = clamp(1000 * L.total / (AUTO_SPEED * L.k), 900, 2600);
+      const dur = clamp(1000 * L.total / (SET.waveSpeed * L.k), 900, 12000);
       auto = { t0: now, dur };
       const p = pathAt(0); cur.x = last.x = p[0]; cur.y = last.y = p[1];
     }
@@ -433,7 +437,7 @@
       const m0x = last.x / L.W, m0y = 1 - last.y / L.H;
       // same push per px travelled at any frame rate: a long step does not hit harder
       const stepPx = Math.hypot(cur.x - last.x, cur.y - last.y);
-      const capK = Math.min(1, 1.8 * SET.radius * L.k / Math.max(stepPx, 1e-6));
+      const capK = Math.min(1, 1.8 * SET.radius * L.k / Math.max(stepPx, 1e-6)) * (auto ? waveBoost() : 1);
       const vx = (cur.x - last.x) * capK * SET.gain / (1920 * L.k);
       const vy = -(cur.y - last.y) * capK * SET.gain / (1080 * L.k);
       last.x = cur.x; last.y = cur.y;
