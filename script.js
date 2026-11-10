@@ -217,7 +217,7 @@
     // Water settings. First version: strength .075, radius 54, decay .976, swirl .016, advect .012, gain 7.
     // Smaller cursor, no swirl (the swirl made letters wobble like jelly), stronger flow so letters
     // are carried and stretched along the cursor's path, and a slightly shorter life.
-    const SET = { strength: 0.075, radius: 32, decay: 0.968, swirl: 0, advect: 0.03, gain: 9.0 };
+    const SET = { strength: 0.13, radius: 37, decay: 0.973, swirl: 0, advect: 0.02, gain: 7.0 };   // tuned by Arina
     tunePanel(SET);
 
     const head = '#version 300 es\nprecision highp float;\n#define ENC ' + ENC + '\n';
@@ -390,8 +390,18 @@
       if (auto) { auto = null; setFrom(e); last.x = cur.x; last.y = cur.y; }
       setFrom(e); lastInput = performance.now();
     });
+    // The default wave moves like a hand swipe: steady speed, short ease in and out.
+    // (It used to be 2-3x slower than a real cursor and sped up and slowed down, so its trail looked different.)
+    const AUTO_SPEED = 1100;                      // design px per second
+    function swipe(t) {
+      const a = 0.15, b = 0.85, v = 1 / (1 - a / 2 - (1 - b) / 2);
+      if (t < a) return v * t * t / (2 * a);
+      if (t < b) return v * (a / 2 + (t - a));
+      const u = t - b, r = 1 - b;
+      return v * (a / 2 + (b - a) + u - u * u / (2 * r));
+    }
     function startAuto(now) {
-      const dur = clamp(3000 * L.total / (1500 * L.k), 2200, 4200);
+      const dur = clamp(1000 * L.total / (AUTO_SPEED * L.k), 900, 2600);
       auto = { t0: now, dur };
       const p = pathAt(0); cur.x = last.x = p[0]; cur.y = last.y = p[1];
     }
@@ -415,7 +425,7 @@
       if (auto) {
         let k = (now - auto.t0) / auto.dur;
         if (k >= 1) { auto = null; lastAutoEnd = now; }
-        else { k = k * k * (3 - 2 * k); const p = pathAt(k); cur.x = p[0]; cur.y = p[1]; }
+        else { const p = pathAt(swipe(k)); cur.x = p[0]; cur.y = p[1]; }
       } else if (armed && !reduce && now - lastInput > 5000 && now - lastAutoEnd > 3500) {
         startAuto(now);
       }
