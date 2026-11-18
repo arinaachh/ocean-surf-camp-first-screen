@@ -2,7 +2,7 @@
    - Layout is plain HTML/CSS. The script only reads where the headline words sit
      and draws photo + headline + surfer on a WebGL canvas behind the copy.
    - The water effect: a small velocity field (ping-pong textures) bends the photo,
-     FIRST and WAVE. "CATCH YOUR" and the surfer stay sharp.
+     CATCH YOUR, FIRST and WAVE. The surfer stays sharp.
    - Without WebGL the plain <img> layers stay visible. */
 (function () {
   'use strict';
@@ -308,8 +308,8 @@
         vec4 f = texture(uFg, q0, -0.9);
         col = mix(col, f.rgb, f.a * smoothstep(0.0, 1.0, uBgP));
 
-        // CATCH YOUR: rises and fades in, never distorted
-        vec4 c = layer(uCatch, uCatchR, s0*uRes - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
+        // CATCH YOUR: rises and fades in, and bends with the water like FIRST WAVE
+        vec4 c = layer(uCatch, uCatchR, px - vec2(0.0, (1.0 - uCatchP)*60.0*uK), 0.0);
         col = mix(col, c.rgb, c.a * uCatchP);
 
         // faint sheen where the water is pulled hardest
